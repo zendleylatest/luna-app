@@ -8,6 +8,8 @@ const userSchema = new mongoose.Schema(
     email: {
       type: String,
       unique: true,
+      trim: true,
+      lowercase: true,
     },
     profession: {
       type: String,
@@ -27,6 +29,35 @@ const userSchema = new mongoose.Schema(
     },
     emailVerified: {
       type: Boolean,
+    },
+    isGuest: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    guestKey: {
+      type: String,
+      unique: true,
+      sparse: true,
+    },
+    androidIdHash: {
+      type: String,
+      lowercase: true,
+      trim: true,
+      index: true,
+      match: /^[a-f0-9]{64}$/,
+    },
+    androidId: {
+      type: String,
+      trim: true,
+      index: true,
+    },
+    pendingBinding: {
+      name: { type: String, trim: true },
+      email: { type: String, trim: true, lowercase: true },
+      password: { type: String },
+      otp: { type: String },
+      requestedAt: { type: Date },
     },
     googleId: {
       type: String,
@@ -117,6 +148,12 @@ const userSchema = new mongoose.Schema(
         min: 0,
       },
       updatedAt: Date,
+      logsUsed: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      logsUpdatedAt: Date,
     },
   },
   { timestamps: true }

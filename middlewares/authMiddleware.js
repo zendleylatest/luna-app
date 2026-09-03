@@ -54,7 +54,7 @@ async function checkUserExistsByEmail(req, res, next) {
     return res.status(400).json({ error: EMAIL_REQUIRED });
   }
 
-  const user = await User.findOne({ email: email.trim() });
+  const user = await User.findOne({ email: email.trim().toLowerCase() });
   if (user) {
     if (req.file) {
       const filePath = path.join(__dirname, "..", "uploads", req.file.filename);

@@ -3,6 +3,8 @@ const OpenAI = require("openai");
 const ChatSession = require("../models/chatModel");
 const ChatUsage = require("../models/chatUsageModel");
 const User = require("../models/usersModel");
+const AndroidDeviceUsage = require("../models/androidDeviceUsageModel");
+const { buildLogEntitlement } = require("../services/logLimitService");
 const { NETWORK_ERROR, INVALID_ID, NOT_FOUND } = require("../messages/message");
 const { verifyIapPurchase } = require("../services/iapVerificationService");
 const {
@@ -191,19 +193,50 @@ async function ensureUsageCounter(user) {
     { $count: "count" },
   ]);
   const counted = Number(rows?.[0]?.count || 0);
-  if (counted > stored) {
+  const userTotal = Math.max(stored, counted);
+  if (userTotal > stored) {
     user.careUsage = {
-      totalMessagesUsed: counted,
+      totalMessagesUsed: userTotal,
       updatedAt: new Date(),
     };
     await user.save();
-    return counted;
   }
-  return stored;
+
+  if (!isGuestUser(user) || !user.androidIdHash) return userTotal;
+
+  const device = await AndroidDeviceUsage.findOne({
+    androidIdHash: user.androidIdHash,
+  });
+  if (!device) return userTotal;
+
+  const guestUserIds = [...(device.guestUserIds || []), user._id];
+  const deviceRows = await ChatSession.aggregate([
+    { $match: { userId: { $in: guestUserIds } } },
+    { $unwind: "$messages" },
+    { $match: { "messages.role": "user" } },
+    { $count: "count" },
+  ]);
+  const countedForDevice = Number(deviceRows?.[0]?.count || 0);
+  const storedForDevice = Number(device?.careUsage?.totalMessagesUsed || 0);
+  const deviceTotal = Math.max(storedForDevice, countedForDevice, userTotal);
+
+  await AndroidDeviceUsage.updateOne(
+    { _id: device._id },
+    {
+      $set: {
+        "careUsage.totalMessagesUsed": deviceTotal,
+        "careUsage.updatedAt": new Date(),
+        lastSeenAt: new Date(),
+      },
+      $addToSet: { guestUserIds: user._id },
+    }
+  );
+  return deviceTotal;
 }
 
 async function buildEntitlement(user, options = {}) {
   const totalUsed = await ensureUsageCounter(user);
+  const logs = await buildLogEntitlement(user);
   const amazonUnlimited = options.amazonUnlimited === true;
 
   if (
@@ -228,6 +261,13 @@ async function buildEntitlement(user, options = {}) {
     used: totalUsed,
     remaining: isPro ? null : Math.max(0, limit - totalUsed),
     hardLocked: !isPro && totalUsed >= limit,
+    chat: {
+      used: totalUsed,
+      limit,
+      remaining: isPro ? null : Math.max(0, limit - totalUsed),
+      hardLocked: !isPro && totalUsed >= limit,
+    },
+    logs,
     subscription: {
       plan: amazonUnlimited
         ? "Amazon"
@@ -435,6 +475,19 @@ async function handleRespond(req, res) {
       updatedAt: new Date(),
     };
     await user.save();
+    if (isGuestUser(user) && user.androidIdHash) {
+      await AndroidDeviceUsage.updateOne(
+        { androidIdHash: user.androidIdHash },
+        {
+          $inc: { "careUsage.totalMessagesUsed": 1 },
+          $set: {
+            "careUsage.updatedAt": new Date(),
+            lastSeenAt: new Date(),
+          },
+          $addToSet: { guestUserIds: user._id },
+        }
+      );
+    }
   } catch (err) {
     console.error("[chat respond] save user msg:", err);
     return res.status(500).json({ error: NETWORK_ERROR });

@@ -79,6 +79,8 @@ app.get("/", (req, res) => {
     endpoints: {
       auth: {
         signup: "POST /auth/signup",
+        guest: "POST /auth/guest",
+        bindAccount: "POST /auth/bind-account (guest auth)",
         verifyOtp: "POST /auth/verify-otp",
         login: "POST /auth/login",
         googleLogin: "POST /auth/google-login",

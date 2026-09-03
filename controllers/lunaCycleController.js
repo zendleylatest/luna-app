@@ -1,4 +1,16 @@
 const LunaCycleState = require("../models/lunaCycleStateModel");
+const { buildCareLimitConfig } = require("../services/careLimitService");
+const {
+  buildLogEntitlement,
+  incrementLogUsage,
+} = require("../services/logLimitService");
+
+function logKeys(state) {
+  const logs = state?.logs;
+  return logs && typeof logs === "object" && !Array.isArray(logs)
+    ? Object.keys(logs)
+    : [];
+}
 
 async function getLunaCycleState(req, res) {
   try {
@@ -21,6 +33,32 @@ async function saveLunaCycleState(req, res) {
       return res.status(400).json({ error: "state object is required" });
     }
 
+    const existing = await LunaCycleState.findOne({
+      userId: req.authUser._id,
+    }).lean();
+    const existingKeys = new Set(logKeys(existing?.state));
+    const addedLogs = logKeys(state).filter((key) => !existingKeys.has(key)).length;
+    const logEntitlement = await buildLogEntitlement(req.authUser);
+
+    if (
+      !logEntitlement.isPro &&
+      addedLogs > 0 &&
+      logEntitlement.used + addedLogs > logEntitlement.limit
+    ) {
+      return res.status(402).json({
+        code: "LOG_LIMIT_REACHED",
+        error: logEntitlement.isGuest
+          ? "Guest logging limit reached. Bind your account to continue."
+          : "Free logging limit reached. Become Pro to continue.",
+        entitlement: {
+          isPro: logEntitlement.isPro,
+          isGuest: logEntitlement.isGuest,
+          limits: buildCareLimitConfig(),
+          logs: logEntitlement,
+        },
+      });
+    }
+
     const record = await LunaCycleState.findOneAndUpdate(
       { userId: req.authUser._id },
       {
@@ -32,10 +70,19 @@ async function saveLunaCycleState(req, res) {
       { new: true, upsert: true, setDefaultsOnInsert: true }
     ).lean();
 
+    if (addedLogs > 0) await incrementLogUsage(req.authUser, addedLogs);
+    const updatedLogs = await buildLogEntitlement(req.authUser);
+
     return res.json({
       state: record.state,
       schemaVersion: record.schemaVersion,
       updatedAt: record.updatedAt,
+      entitlement: {
+        isPro: updatedLogs.isPro,
+        isGuest: updatedLogs.isGuest,
+        limits: buildCareLimitConfig(),
+        logs: updatedLogs,
+      },
     });
   } catch (error) {
     console.error("[luna-cycle:save]", error);

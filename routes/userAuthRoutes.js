@@ -1,5 +1,8 @@
 const express = require("express");
 const {
+  handleCreateGuest,
+  handleRestoreGuest,
+  handleBindGuestAccount,
   handleUserLogin,
   handleUserSignUp,
   handleVerifyOTP,
@@ -17,6 +20,9 @@ const uploadProfile = require("../uploadsProfile");
 const router = express.Router();
 
 router.post("/signup", upload.single("image"), checkUserExistsByEmail, handleUserSignUp);
+router.post("/guest", handleCreateGuest);
+router.post("/guest/restore", handleRestoreGuest);
+router.post("/bind-account", authenticate, handleBindGuestAccount);
 router.post("/verify-otp", handleVerifyOTP);
 router.post("/login", upload.single("image"), handleUserLogin);
 router.post("/google-login", handleGoogleLogin);

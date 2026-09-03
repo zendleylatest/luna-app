@@ -1,4 +1,5 @@
 const bcrypt = require("bcrypt");
+const crypto = require("crypto");
 const mongoose = require("mongoose");
 const { OAuth2Client } = require("google-auth-library");
 const { setUser } = require("../services/userAuthService");
@@ -9,10 +10,12 @@ const {
   logOtp,
 } = require("../services/emailService");
 const User = require("../models/usersModel");
+const AndroidDeviceUsage = require("../models/androidDeviceUsageModel");
 const ChatSession = require("../models/chatModel");
 const ChatUsage = require("../models/chatUsageModel");
 const PromptGeneration = require("../models/promptGenerationModel");
 const PushDeviceToken = require("../models/pushDeviceTokenModel");
+const LunaCycleState = require("../models/lunaCycleStateModel");
 const {
   NETWORK_ERROR,
   SIGNED_UP,
@@ -37,6 +40,265 @@ const googleClient = process.env.GOOGLE_CLIENT_ID
 const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 const isValidOTP = (otp) => typeof otp === "string" && /^\d{6}$/.test(otp);
 
+function authResponse(user) {
+  return {
+    token: setUser(user),
+    userId: user._id,
+    id: user._id,
+    username: user.name,
+    useremail: user.isGuest ? null : user.email,
+    isGuest: user.isGuest === true,
+    androidId: user.androidId || null,
+    androidIdHash: user.androidIdHash || null,
+  };
+}
+
+function normalizeAndroidIdHash(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(normalized) ? normalized : null;
+}
+
+function normalizeAndroidId(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return /^[a-f0-9]{8,64}$/.test(normalized) ? normalized : null;
+}
+
+function readAndroidIdentity(body) {
+  const androidId = normalizeAndroidId(body?.androidId);
+  const sentHash = normalizeAndroidIdHash(body?.androidIdHash);
+  if (!androidId) return { androidId: null, androidIdHash: sentHash };
+  const packageName = process.env.ANDROID_PACKAGE_NAME || "com.speckpro.periodtracker.luna.app";
+  const calculatedHash = crypto
+    .createHash("sha256")
+    .update(`${packageName}:${androidId}`)
+    .digest("hex");
+  if (sentHash && sentHash !== calculatedHash) return null;
+  return { androidId, androidIdHash: calculatedHash };
+}
+
+function applyAndroidIdentity(user, body) {
+  const identity = readAndroidIdentity(body);
+  if (!identity) return false;
+  if (identity.androidId) user.androidId = identity.androidId;
+  if (identity.androidIdHash) user.androidIdHash = identity.androidIdHash;
+  return true;
+}
+
+function logAuthUser(label, user) {
+  console.log(label, {
+    userId: user?._id,
+    name: user?.name,
+    email: user?.email,
+    isGuest: user?.isGuest === true,
+    androidId: user?.androidId || null,
+    androidIdHash: user?.androidIdHash || null,
+  });
+}
+
+async function findActiveDeviceGuest(device) {
+  if (!device) return null;
+  if (device.activeGuestUserId) {
+    const active = await User.findOne({
+      _id: device.activeGuestUserId,
+      isGuest: true,
+    });
+    if (active) return active;
+  }
+  return User.findOne({
+    $or: [
+      { androidIdHash: device.androidIdHash },
+      ...(device.guestUserIds?.length
+        ? [{ _id: { $in: device.guestUserIds } }]
+        : []),
+    ],
+    isGuest: true,
+  }).sort({ updatedAt: -1 });
+}
+
+async function attachGuestToDevice(user, device) {
+  if (!user || !device) return;
+  if (
+    user.androidIdHash !== device.androidIdHash ||
+    (device.androidId && user.androidId !== device.androidId)
+  ) {
+    user.androidIdHash = device.androidIdHash;
+    if (device.androidId) user.androidId = device.androidId;
+    await user.save();
+  }
+  const existingUsed = Number(user?.careUsage?.totalMessagesUsed || 0);
+  await AndroidDeviceUsage.updateOne(
+    { _id: device._id },
+    {
+      $set: {
+        activeGuestUserId: user._id,
+        lastSeenAt: new Date(),
+        ...(existingUsed > Number(device?.careUsage?.totalMessagesUsed || 0)
+          ? {
+              "careUsage.totalMessagesUsed": existingUsed,
+              "careUsage.updatedAt": new Date(),
+            }
+          : {}),
+      },
+      $addToSet: { guestUserIds: user._id },
+    }
+  );
+}
+
+async function handleCreateGuest(req, res) {
+  try {
+    const guestKey = String(req.body?.guestKey || "").trim();
+    const identity = readAndroidIdentity(req.body);
+    if (!identity) {
+      return res.status(400).json({ error: "Android device identity does not match its hash" });
+    }
+    const { androidId, androidIdHash } = identity;
+    if (!androidIdHash && (guestKey.length < 16 || guestKey.length > 200)) {
+      return res.status(400).json({
+        error: "A valid Android device identity or guest key is required",
+      });
+    }
+
+    let device = null;
+    let user = null;
+    if (androidIdHash) {
+      device = await AndroidDeviceUsage.findOneAndUpdate(
+        { androidIdHash },
+        {
+          $set: {
+            lastSeenAt: new Date(),
+            ...(androidId ? { androidId } : {}),
+          },
+          $setOnInsert: { androidIdHash },
+        },
+        { new: true, upsert: true }
+      );
+      user = await findActiveDeviceGuest(device);
+    }
+    if (!user && guestKey.length >= 16 && guestKey.length <= 200) {
+      user = await User.findOne({
+        guestKey,
+        isGuest: true,
+        ...(androidIdHash
+          ? {
+              $or: [
+                { androidIdHash },
+                { androidIdHash: null },
+                { androidIdHash: { $exists: false } },
+              ],
+            }
+          : {}),
+      });
+    }
+    if (!user) {
+      user = await User.create({
+        name: "Guest",
+        email: `guest_${crypto.randomUUID()}@luna.invalid`,
+        emailVerified: false,
+        isGuest: true,
+        ...(guestKey ? { guestKey } : {}),
+        ...(androidIdHash ? { androidIdHash } : {}),
+        ...(androidId ? { androidId } : {}),
+        creationsPublic: false,
+      });
+    }
+    await attachGuestToDevice(user, device);
+    logAuthUser("[guest device]", user);
+
+    return res.status(201).json(authResponse(user));
+  } catch (err) {
+    console.error("create guest error:", err);
+    return res.status(500).json({ error: NETWORK_ERROR });
+  }
+}
+
+async function handleRestoreGuest(req, res) {
+  try {
+    const identity = readAndroidIdentity(req.body);
+    if (!identity) {
+      return res.status(400).json({ error: "Android device identity does not match its hash" });
+    }
+    const { androidId, androidIdHash } = identity;
+    if (!androidIdHash) {
+      return res.status(400).json({ error: "A valid Android device identity is required" });
+    }
+
+    const device = await AndroidDeviceUsage.findOne({ androidIdHash });
+    if (!device) {
+      return res.status(404).json({ registered: false });
+    }
+    if (androidId && device.androidId !== androidId) {
+      device.androidId = androidId;
+      device.lastSeenAt = new Date();
+      await device.save();
+    }
+
+    const user = await findActiveDeviceGuest(device);
+    if (!user) {
+      device.lastSeenAt = new Date();
+      await device.save();
+      return res.status(404).json({
+        registered: true,
+        usage: {
+          totalMessagesUsed: Number(device?.careUsage?.totalMessagesUsed || 0),
+        },
+      });
+    }
+
+    await attachGuestToDevice(user, device);
+    logAuthUser("[guest restore]", user);
+    return res.json({ registered: true, ...authResponse(user) });
+  } catch (err) {
+    console.error("restore guest error:", err);
+    return res.status(500).json({ error: NETWORK_ERROR });
+  }
+}
+
+async function handleBindGuestAccount(req, res) {
+  try {
+    const user = req.authUser;
+    if (!user?.isGuest) {
+      return res.status(409).json({ error: "This account is already bound" });
+    }
+
+    const name = String(req.body?.name || "").trim();
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+    if (name.length < 2) return res.status(400).json({ error: NAME_REQUIRED });
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email format" });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters" });
+    }
+
+    const existing = await User.exists({ email, _id: { $ne: user._id } });
+    if (existing) {
+      return res.status(409).json({ error: "User already exists" });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const hashed = await bcrypt.hash(password, 10);
+    await sendOTPEmail(email, otp);
+
+    user.pendingBinding = {
+      name,
+      email,
+      password: hashed,
+      otp,
+      requestedAt: new Date(),
+    };
+    await user.save();
+
+    return res.status(200).json({
+      message: "Verification code sent. Your guest data will be preserved.",
+      userId: user._id,
+    });
+  } catch (err) {
+    console.error("bind guest account error:", err);
+    return res.status(500).json({ error: OTP_SEND_FAILED });
+  }
+}
+
 async function handleUserSignUp(req, res) {
   const body = req.body;
   if (!body) return res.status(400).json({ message: ALL_FILEDS_REQUIRED });
@@ -45,26 +307,35 @@ async function handleUserSignUp(req, res) {
   if (!body.password) return res.status(400).json({ message: PASSWORD_REQUIRED });
 
   try {
+    const email = String(body.email).trim().toLowerCase();
+    const identity = readAndroidIdentity(body);
+    if (!identity) {
+      return res.status(400).json({ error: "Android device identity does not match its hash" });
+    }
     const hashed = await bcrypt.hash(body.password, 10);
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
     const result = await User.create({
       name: body.name,
-      email: body.email,
+      email,
       profession: body.profession ?? undefined,
       password: hashed,
       image: req.file ? `/uploads/${req.file.filename}` : null,
       otp,
       emailVerified: false,
+      ...(identity.androidId ? { androidId: identity.androidId } : {}),
+      ...(identity.androidIdHash ? { androidIdHash: identity.androidIdHash } : {}),
     });
 
     try {
-      await sendOTPEmail(body.email.trim(), otp);
+      await sendOTPEmail(email, otp);
     } catch (mailErr) {
       console.error("OTP email error:", mailErr);
       await User.findByIdAndDelete(result._id);
       return res.status(500).json({ error: OTP_SEND_FAILED });
     }
+
+    logAuthUser("[user signup]", result);
 
     res.status(201).json({
       message: "User created. OTP sent to email.",
@@ -94,6 +365,52 @@ async function handleVerifyOTP(req, res) {
       return res.status(400).json({ error: USER_NOT_FOUND });
     }
 
+    const pendingBinding = user.pendingBinding;
+    if (pendingBinding?.otp) {
+      const requestedAt = pendingBinding.requestedAt
+        ? new Date(pendingBinding.requestedAt).getTime()
+        : 0;
+      if (!requestedAt || Date.now() - requestedAt > 15 * 60 * 1000) {
+        user.pendingBinding = undefined;
+        await user.save();
+        return res.status(400).json({ error: "Verification code expired" });
+      }
+      if (pendingBinding.otp !== String(otp).trim()) {
+        return res.status(400).json({ error: INVALID_OTP });
+      }
+
+      const existing = await User.exists({
+        email: pendingBinding.email,
+        _id: { $ne: user._id },
+      });
+      if (existing) {
+        return res.status(409).json({ error: "User already exists" });
+      }
+
+      user.name = pendingBinding.name;
+      user.email = pendingBinding.email;
+      user.password = pendingBinding.password;
+      user.emailVerified = true;
+      user.isGuest = false;
+      user.guestKey = undefined;
+      user.pendingBinding = undefined;
+      user.otp = null;
+      await user.save();
+
+      if (user.androidIdHash) {
+        await AndroidDeviceUsage.updateOne(
+          { androidIdHash: user.androidIdHash, activeGuestUserId: user._id },
+          { $set: { activeGuestUserId: null, lastSeenAt: new Date() } }
+        );
+      }
+
+      return res.json({
+        message: "Guest account bound successfully.",
+        bound: true,
+        ...authResponse(user),
+      });
+    }
+
     if (user.otp !== String(otp).trim()) {
       return res.status(400).json({ error: INVALID_OTP });
     }
@@ -111,7 +428,8 @@ async function handleVerifyOTP(req, res) {
 
 async function handleUserLogin(req, res) {
   try {
-    const { email, password } = req.body;
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
 
     const user = await User.findOne({ email });
     if (!user) return res.status(400).json({ error: USER_NOT_FOUND });
@@ -128,6 +446,10 @@ async function handleUserLogin(req, res) {
 
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) return res.status(400).json({ error: WRONG_PASSWORD });
+    if (!applyAndroidIdentity(user, req.body)) {
+      return res.status(400).json({ error: "Android device identity does not match its hash" });
+    }
+    await user.save();
     const token = setUser(user);
 
     res.json({
@@ -217,7 +539,7 @@ async function handleGetProfile(req, res) {
     }
 
     const user = await User.findById(id).select(
-      "-otp -resetOTP -password -emailVerified"
+      "-otp -resetOTP -password -emailVerified -guestKey -pendingBinding"
     );
     if (!user) return res.status(404).json({ error: "User not found" });
 
@@ -291,6 +613,11 @@ async function handleDeleteAccount(req, res) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
+    if (!applyAndroidIdentity(user, req.body)) {
+      return res.status(400).json({ error: "Android device identity does not match its hash" });
+    }
+    await user.save();
+
     const userId = user._id;
     const userEmail = user.email ? user.email.toString().trim().toLowerCase() : "";
 
@@ -304,6 +631,15 @@ async function handleDeleteAccount(req, res) {
         ],
       }),
       PushDeviceToken.deleteMany({ userId: userId.toString() }),
+      LunaCycleState.deleteOne({ userId }),
+      ...(user.androidIdHash
+        ? [
+            AndroidDeviceUsage.updateOne(
+              { androidIdHash: user.androidIdHash, activeGuestUserId: userId },
+              { $set: { activeGuestUserId: null, lastSeenAt: new Date() } }
+            ),
+          ]
+        : []),
     ]);
 
     await User.deleteOne({ _id: userId });
@@ -388,6 +724,9 @@ async function handleResetPassword(req, res) {
 }
 
 module.exports = {
+  handleCreateGuest,
+  handleRestoreGuest,
+  handleBindGuestAccount,
   handleUserSignUp,
   handleUserLogin,
   handleVerifyOTP,
