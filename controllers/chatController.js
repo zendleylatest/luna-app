@@ -47,7 +47,13 @@ Safety rules:
   const lunaGuidance = `Important Luna context rules:
 - The app may provide saved cycle data in the context block. Treat it as user-provided app data for this conversation.
 - If cycle data is missing, say what Luna needs the user to log, such as last period date, flow, symptoms, or mood.
-- For fertility, ovulation, and period timing, always call them estimates and avoid guaranteeing outcomes.`;
+- For fertility, ovulation, and period timing, always call them estimates and avoid guaranteeing outcomes.
+
+Language rules:
+- Detect the language of the latest user message and respond entirely in that language.
+- Do not choose the response language from the app interface language, locale, or saved cycle data.
+- If the latest message mixes languages, use the dominant language while preserving technical terms when needed.
+- If the latest message has no clear language, use the language used by the most recent user messages.`;
 
   if (!deviceContext || typeof deviceContext !== "string" || !deviceContext.trim()) {
     return `${lunaPrompt}

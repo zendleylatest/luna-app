@@ -122,6 +122,7 @@ app.get("/", (req, res) => {
       },
       lunaCycle: {
         getState: "GET /api/luna-cycle/state",
+        getInsights: "GET /api/luna-cycle/insights?range=30|90|180|365&language=en",
         saveState: "PUT /api/luna-cycle/state",
         deleteState: "DELETE /api/luna-cycle/state",
       },

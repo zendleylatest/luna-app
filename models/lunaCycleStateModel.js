@@ -17,6 +17,19 @@ const lunaCycleStateSchema = new mongoose.Schema(
       type: Number,
       default: 1,
     },
+    aiInsightsCache: {
+      stateHash: String,
+      cards: [
+        {
+          title: String,
+          body: String,
+          category: String,
+          _id: false,
+        },
+      ],
+      generatedAt: Date,
+      model: String,
+    },
   },
   { timestamps: true }
 );

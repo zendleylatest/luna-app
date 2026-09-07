@@ -4,6 +4,12 @@ const {
   buildLogEntitlement,
   incrementLogUsage,
 } = require("../services/logLimitService");
+const { computeUserIsPro } = require("../services/careLimitService");
+const {
+  buildInsightsHash,
+  buildStandardInsights,
+  generateAiInsights,
+} = require("../services/lunaInsightsService");
 
 function logKeys(state) {
   const logs = state?.logs;
@@ -100,8 +106,89 @@ async function deleteLunaCycleState(req, res) {
   }
 }
 
+function hasActivePremium(user) {
+  if (!computeUserIsPro(user)) return false;
+  const expiresAt = user?.subscription?.expiresAt;
+  return !expiresAt || new Date(expiresAt).getTime() > Date.now();
+}
+
+function insightLanguage(value) {
+  const supported = new Set([
+    "en", "zh", "es", "fr", "pt", "ja", "ar",
+    "de", "id", "ru", "sv", "ur", "hi",
+  ]);
+  const language = String(value || "en").toLowerCase().split(/[-_]/)[0];
+  return supported.has(language) ? language : "en";
+}
+
+async function getLunaInsights(req, res) {
+  try {
+    const record = await LunaCycleState.findOne({ userId: req.authUser._id });
+    const state = record?.state || {};
+    const standard = buildStandardInsights(state, req.query.range);
+    const language = insightLanguage(req.query.language);
+    const isPremium = hasActivePremium(req.authUser);
+    if (!isPremium) {
+      return res.json({ standard, isPremium: false, aiInsights: [] });
+    }
+    if (!Object.keys(state?.logs || {}).length) {
+      return res.json({ standard, isPremium: true, aiInsights: [] });
+    }
+
+    const stateHash = buildInsightsHash(state, language);
+    const cached = record?.aiInsightsCache;
+    if (cached?.stateHash === stateHash && cached.cards?.length) {
+      return res.json({
+        standard,
+        isPremium: true,
+        aiInsights: cached.cards,
+        generatedAt: cached.generatedAt,
+        cached: true,
+      });
+    }
+
+    // AI cards describe the overall recent pattern and do not change when the
+    // user switches the symptom-chart range.
+    const aiStandard = buildStandardInsights(state, 365);
+    const generated = await generateAiInsights(state, aiStandard, language);
+    if (record) {
+      record.aiInsightsCache = {
+        stateHash,
+        cards: generated.cards,
+        generatedAt: new Date(),
+        model: generated.model,
+      };
+      await record.save();
+    }
+    await req.authUser.updateOne({
+      $inc: {
+        "openAiUsage.promptTokens": generated.usage.promptTokens,
+        "openAiUsage.completionTokens": generated.usage.completionTokens,
+        "openAiUsage.totalTokens": generated.usage.totalTokens,
+        "openAiUsage.requestCount": 1,
+      },
+      $set: { "openAiUsage.lastUsedAt": new Date() },
+    });
+    return res.json({
+      standard,
+      isPremium: true,
+      aiInsights: generated.cards,
+      generatedAt: new Date(),
+      cached: false,
+    });
+  } catch (error) {
+    console.error("[luna-cycle:insights]", error);
+    return res.status(error.statusCode || 502).json({
+      error: error.statusCode === 503
+        ? error.message
+        : "Could not generate Luna insights",
+    });
+  }
+}
+
 module.exports = {
   getLunaCycleState,
   saveLunaCycleState,
   deleteLunaCycleState,
+  getLunaInsights,
 };

@@ -4,7 +4,8 @@
   "description": "AI text prompt generator API (Express, MongoDB, OpenAI) with user auth",
   "main": "index.js",
   "scripts": {
-    "start": "nodemon index.js"
+    "start": "nodemon index.js",
+    "test": "node --test"
   },
   "author": "",
   "license": "ISC",
