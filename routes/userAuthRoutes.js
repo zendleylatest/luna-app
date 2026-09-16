@@ -2,6 +2,7 @@ const express = require("express");
 const {
   handleCreateGuest,
   handleRestoreGuest,
+  handleUpdateGuestDevice,
   handleBindGuestAccount,
   handleUserLogin,
   handleUserSignUp,
@@ -22,6 +23,7 @@ const router = express.Router();
 router.post("/signup", upload.single("image"), checkUserExistsByEmail, handleUserSignUp);
 router.post("/guest", handleCreateGuest);
 router.post("/guest/restore", handleRestoreGuest);
+router.post("/guest/device", authenticate, handleUpdateGuestDevice);
 router.post("/bind-account", authenticate, handleBindGuestAccount);
 router.post("/verify-otp", handleVerifyOTP);
 router.post("/login", upload.single("image"), handleUserLogin);

@@ -253,6 +253,97 @@ async function handleRestoreGuest(req, res) {
   }
 }
 
+async function handleUpdateGuestDevice(req, res) {
+  try {
+    const user = req.authUser;
+    if (!user?.isGuest) {
+      return res.status(409).json({ error: "Only guest sessions can change guest devices" });
+    }
+
+    const identity = readAndroidIdentity(req.body);
+    if (!identity?.androidIdHash || !identity.androidId) {
+      return res.status(400).json({ error: "A valid Android device identity is required" });
+    }
+
+    const previousAndroidId = normalizeAndroidId(req.body?.previousAndroidId);
+    if (previousAndroidId && user.androidId && previousAndroidId !== user.androidId) {
+      return res.status(409).json({ error: "The saved Android device does not match this guest" });
+    }
+
+    const previousHash = user.androidIdHash || null;
+    if (previousHash === identity.androidIdHash) {
+      user.androidId = identity.androidId;
+      await user.save();
+      const device = await AndroidDeviceUsage.findOneAndUpdate(
+        { androidIdHash: identity.androidIdHash },
+        {
+          $set: {
+            androidId: identity.androidId,
+            activeGuestUserId: user._id,
+            lastSeenAt: new Date(),
+          },
+          $addToSet: { guestUserIds: user._id },
+        },
+        { new: true, upsert: true }
+      );
+      await attachGuestToDevice(user, device);
+      return res.json(authResponse(user));
+    }
+
+    const targetDevice = await AndroidDeviceUsage.findOne({
+      androidIdHash: identity.androidIdHash,
+    });
+    if (targetDevice) {
+      const targetGuest = await findActiveDeviceGuest(targetDevice);
+      if (targetGuest && targetGuest._id.toString() !== user._id.toString()) {
+        return res.status(409).json({
+          error: "This Android device is already linked to another guest",
+        });
+      }
+    }
+
+    let device = targetDevice;
+    const previousDevice = previousHash
+      ? await AndroidDeviceUsage.findOne({ androidIdHash: previousHash })
+      : null;
+    if (!device && previousDevice) {
+      previousDevice.androidId = identity.androidId;
+      previousDevice.androidIdHash = identity.androidIdHash;
+      previousDevice.activeGuestUserId = user._id;
+      previousDevice.lastSeenAt = new Date();
+      if (!previousDevice.guestUserIds.some((id) => id.toString() === user._id.toString())) {
+        previousDevice.guestUserIds.push(user._id);
+      }
+      device = await previousDevice.save();
+    } else if (!device) {
+      device = await AndroidDeviceUsage.create({
+        androidId: identity.androidId,
+        androidIdHash: identity.androidIdHash,
+        activeGuestUserId: user._id,
+        guestUserIds: [user._id],
+      });
+    } else {
+      await attachGuestToDevice(user, device);
+      if (previousDevice && previousDevice._id.toString() !== device._id.toString()) {
+        await AndroidDeviceUsage.updateOne(
+          { _id: previousDevice._id, activeGuestUserId: user._id },
+          { $set: { activeGuestUserId: null, lastSeenAt: new Date() } }
+        );
+      }
+    }
+
+    user.androidId = identity.androidId;
+    user.androidIdHash = identity.androidIdHash;
+    await user.save();
+    await attachGuestToDevice(user, device);
+    logAuthUser("[guest device changed]", user);
+    return res.json(authResponse(user));
+  } catch (err) {
+    console.error("update guest device error:", err);
+    return res.status(500).json({ error: NETWORK_ERROR });
+  }
+}
+
 async function handleBindGuestAccount(req, res) {
   try {
     const user = req.authUser;
@@ -726,6 +817,7 @@ async function handleResetPassword(req, res) {
 module.exports = {
   handleCreateGuest,
   handleRestoreGuest,
+  handleUpdateGuestDevice,
   handleBindGuestAccount,
   handleUserSignUp,
   handleUserLogin,
