@@ -116,10 +116,6 @@ function normalizeSubscriptionStatus(status) {
   return allowed.has(normalized) ? normalized : "inactive";
 }
 
-function isAmazonClient(req) {
-  return false;
-}
-
 async function clearPremiumEntitlement(user, status = "inactive", source = "restore") {
   user.isPro = false;
   user.subscriptionPlan = "Free";
@@ -267,13 +263,11 @@ async function ensureUsageCounter(user) {
   return deviceTotal;
 }
 
-async function buildEntitlement(user, options = {}) {
+async function buildEntitlement(user) {
   const totalUsed = await ensureUsageCounter(user);
   const logs = await buildLogEntitlement(user);
-  const amazonUnlimited = options.amazonUnlimited === true;
 
   if (
-    !amazonUnlimited &&
     computeUserIsPro(user) &&
     user?.subscription?.expiresAt &&
     new Date(user.subscription.expiresAt).getTime() <= Date.now()
@@ -281,9 +275,9 @@ async function buildEntitlement(user, options = {}) {
     await clearPremiumEntitlement(user, "expired", user.subscription?.source || "expiry_check");
   }
 
-  const isPro = amazonUnlimited || computeUserIsPro(user);
+  const isPro = computeUserIsPro(user);
   const isGuest = isGuestUser(user);
-  const limit = amazonUnlimited ? null : getCareChatLimitForUser(user);
+  const limit = getCareChatLimitForUser(user);
   return {
     isPro,
     isGuest,
@@ -302,35 +296,18 @@ async function buildEntitlement(user, options = {}) {
     },
     logs,
     subscription: {
-      plan: amazonUnlimited
-        ? "Amazon"
-        : user.subscriptionPlan || (isPro ? "Premium" : "Free"),
-      status: amazonUnlimited
-        ? "active"
-        : user?.subscription?.status || (isPro ? "active" : "inactive"),
+      plan: user.subscriptionPlan || (isPro ? "Premium" : "Free"),
+      status: user?.subscription?.status || (isPro ? "active" : "inactive"),
       productId: user?.subscription?.productId || null,
-      platform: amazonUnlimited ? "amazon" : user?.subscription?.platform || "none",
+      platform: user?.subscription?.platform || "none",
       expiresAt: user?.subscription?.expiresAt || null,
       lastVerifiedAt: user?.subscription?.lastVerifiedAt || null,
-      source: amazonUnlimited ? "amazon" : user?.subscription?.source || "none",
+      source: user?.subscription?.source || "none",
     },
   };
 }
 
 async function handleGetCareLimits(req, res) {
-  if (isAmazonClient(req)) {
-    return res.json({
-      success: true,
-      limits: {
-        guest: null,
-        registered: null,
-        pro: null,
-        proLabel: "unlimited",
-        amazon: null,
-        amazonLabel: "unlimited",
-      },
-    });
-  }
   return res.json({
     success: true,
     limits: buildCareLimitConfig(),
@@ -466,9 +443,7 @@ async function handleRespond(req, res) {
     }
 
     await refreshStoredStoreSubscription(user);
-    const entitlement = await buildEntitlement(user, {
-      amazonUnlimited: isAmazonClient(req),
-    });
+    const entitlement = await buildEntitlement(user);
     if (entitlement.hardLocked) {
       const accountType = entitlement.isGuest ? "Guest" : "Free";
       return res.status(402).json({
@@ -526,9 +501,7 @@ async function handleRespond(req, res) {
     console.error("[chat respond] save user msg:", err);
     return res.status(500).json({ error: NETWORK_ERROR });
   }
-  const updatedEntitlement = await buildEntitlement(user, {
-    amazonUnlimited: isAmazonClient(req),
-  });
+  const updatedEntitlement = await buildEntitlement(user);
 
   // Build OpenAI payload — cap at last 40 turns to stay within token limits
   const history = session.messages.slice(-40).map((m) => ({
@@ -793,9 +766,7 @@ async function handleGetEntitlement(req, res) {
     await refreshStoredStoreSubscription(user);
     return res.json({
       success: true,
-      entitlement: await buildEntitlement(user, {
-        amazonUnlimited: isAmazonClient(req),
-      }),
+      entitlement: await buildEntitlement(user),
     });
   } catch (err) {
     console.error("[chat entitlement]", err);
