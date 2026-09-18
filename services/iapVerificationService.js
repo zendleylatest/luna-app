@@ -153,18 +153,45 @@ function buildAmazonSubscriptionResult(data, productId, receiptId) {
   const renewalDateMs = Number(data?.renewalDate || 0);
   const purchaseDateMs = Number(data?.purchaseDate || 0);
   const now = Date.now();
-  const active =
-    !cancelDateMs && (!renewalDateMs || renewalDateMs > now) && data?.sku === productId;
+
+  // Current Amazon RVS responses identify the SKU in `productId`. Some older/
+  // legacy payloads reportedly used `sku` instead, so fall back to that only
+  // when `productId` is absent from the response.
+  const usedLegacySkuField = !data?.productId && Boolean(data?.sku);
+  const responseProductId = data?.productId || data?.sku;
+
+  const productMatches = Boolean(responseProductId) && responseProductId === productId;
+  const receiptMatches = Boolean(data?.receiptId) && data.receiptId === receiptId;
+  const isSubscription = data?.productType === "SUBSCRIPTION";
+  const notCancelled = !cancelDateMs;
+  const notExpired = !renewalDateMs || renewalDateMs > now;
+
+  const identityValid = productMatches && receiptMatches && isSubscription;
+  const active = identityValid && notCancelled && notExpired;
+
+  let status;
+  if (!identityValid) {
+    status = "invalid";
+  } else if (!active) {
+    status = "expired";
+  } else {
+    status = "active";
+  }
 
   return {
     ok: active,
-    status: active ? "active" : "expired",
+    status,
+    retryable: false,
     expiresAt: renewalDateMs ? new Date(renewalDateMs).toISOString() : null,
     platform: "amazon",
     source: "amazon_rvs",
     payload: {
       receiptId,
+      productId: responseProductId,
       sku: data?.sku,
+      usedLegacySkuField,
+      productMatches,
+      receiptMatches,
       productType: data?.productType,
       purchaseDate: purchaseDateMs ? new Date(purchaseDateMs).toISOString() : null,
       cancelDate: cancelDateMs ? new Date(cancelDateMs).toISOString() : null,
@@ -179,9 +206,15 @@ function buildAmazonSubscriptionResult(data, productId, receiptId) {
 
 async function verifyAmazonPurchase({ productId, purchaseToken, storeUserId }) {
   const secret = amazonSharedSecret();
-  if (!secret) throw new Error("Amazon RVS shared secret is missing");
+  if (!secret) {
+    const err = new Error("Amazon RVS shared secret is missing");
+    err.retryable = true; // configuration problem, not proof the subscription is inactive
+    throw err;
+  }
   if (!productId || !purchaseToken || !storeUserId) {
-    throw new Error("Missing productId/purchaseToken/storeUserId");
+    const err = new Error("Missing productId/purchaseToken/storeUserId");
+    err.retryable = true;
+    throw err;
   }
 
   const baseUrl = amazonSandboxEnabled()
@@ -193,10 +226,29 @@ async function verifyAmazonPurchase({ productId, purchaseToken, storeUserId }) {
     purchaseToken
   )}`;
 
-  const response = await fetch(url, { headers: { Accept: "application/json" } });
+  let response;
+  try {
+    response = await fetch(url, { headers: { Accept: "application/json" } });
+  } catch (e) {
+    const err = new Error(`Amazon RVS request failed: ${e.message}`);
+    err.retryable = true;
+    throw err;
+  }
+
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data?.message || `Amazon RVS verify failed (${response.status})`);
+    const err = new Error(data?.message || `Amazon RVS verify failed (${response.status})`);
+    err.httpStatus = response.status;
+    // 400/404/410 are Amazon's documented invalid/cancelled/not-found receipt
+    // responses — treat those as definitive. Throttling (429), server errors
+    // (5xx), and anything else unexpected are transient/configuration issues
+    // that must not be treated as proof the subscription is inactive.
+    err.retryable = !(
+      response.status === 400 ||
+      response.status === 404 ||
+      response.status === 410
+    );
+    throw err;
   }
 
   return buildAmazonSubscriptionResult(data, productId, purchaseToken);
@@ -254,9 +306,13 @@ async function verifyIapPurchase({
       return await verifyAmazonPurchase({ productId, purchaseToken, storeUserId });
     } catch (e) {
       console.warn("[iapVerify] Amazon verification failed:", e.message);
+      // Default to retryable when unclassified: an unexpected error is never
+      // proof that a subscription is inactive, so it must not revoke access.
+      const retryable = e.retryable !== false;
       return {
         ok: false,
-        status: "verify_failed",
+        status: retryable ? "verify_failed" : "invalid",
+        retryable,
         platform: "amazon",
         source: "amazon_rvs",
         expiresAt: null,
@@ -293,6 +349,7 @@ async function verifyIapPurchase({
       return {
         ok: false,
         status: "verify_failed",
+        retryable: true,
         platform: "android",
         source: "google_play",
         expiresAt: null,
@@ -313,4 +370,7 @@ async function verifyIapPurchase({
   }
 }
 
-module.exports = { verifyIapPurchase };
+module.exports = {
+  verifyIapPurchase,
+  buildAmazonSubscriptionResult,
+};

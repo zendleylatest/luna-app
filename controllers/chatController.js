@@ -15,6 +15,11 @@ const {
 } = require("../services/careLimitService");
 const STORE_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STORE_REFRESH_EXPIRY_WINDOW_MS = 24 * 60 * 60 * 1000;
+// Amazon recommends checking each active receipt with RVS within 72 hours.
+// A transient failure (network error, throttling, 5xx, or bad server config)
+// is not evidence the subscription is inactive, so we keep the last known
+// entitlement until we've failed to reverify for longer than this window.
+const STORE_VERIFY_GRACE_MS = 72 * 60 * 60 * 1000;
 
 // ── constants ──────────────────────────────────────────────────────────────
 
@@ -150,6 +155,28 @@ function shouldRefreshStoreSubscription(user, force = false) {
 
 async function applyStoreVerification(user, verification) {
   if (!verification.ok) {
+    if (verification.retryable) {
+      // Transient/configuration failure: never revoke on this alone. Keep the
+      // last known entitlement until we've been unable to reverify for
+      // longer than the grace window, then treat it as effectively expired.
+      const subscription = user?.subscription || {};
+      const lastVerifiedMs = subscription.lastVerifiedAt
+        ? new Date(subscription.lastVerifiedAt).getTime()
+        : 0;
+      const withinGrace =
+        Boolean(lastVerifiedMs) && Date.now() - lastVerifiedMs < STORE_VERIFY_GRACE_MS;
+
+      if (withinGrace) {
+        user.subscription = {
+          ...subscription,
+          lastVerifyAttemptAt: new Date(),
+          lastVerifyError: verification.reason || verification.status || null,
+        };
+        await user.save();
+        return;
+      }
+    }
+
     await clearPremiumEntitlement(
       user,
       verification.status || "verify_failed",
@@ -438,6 +465,7 @@ async function handleRespond(req, res) {
       });
     }
 
+    await refreshStoredStoreSubscription(user);
     const entitlement = await buildEntitlement(user, {
       amazonUnlimited: isAmazonClient(req),
     });
@@ -846,6 +874,26 @@ async function handleClearPremiumAfterRestore(req, res) {
   try {
     const user = await User.findById(req.authUser._id);
     if (!user) return res.status(404).json({ error: NOT_FOUND });
+
+    // The device reported no purchases to restore, but that alone is not
+    // reliable (see the audit's restore/pagination gaps). If we have a
+    // previously stored receipt, re-verify it directly with the store rather
+    // than trusting an empty client-side result before revoking access.
+    const hasStoredReceipt = Boolean(
+      user?.subscription?.productId && user?.subscription?.purchaseToken
+    );
+    if (hasStoredReceipt) {
+      const verification = await refreshStoredStoreSubscription(user, { force: true });
+      if (!verification || verification.ok || verification.retryable) {
+        return res.json({
+          success: true,
+          message: verification?.ok
+            ? "Existing subscription is still active."
+            : "Could not confirm restore; keeping existing entitlement.",
+          entitlement: await buildEntitlement(user),
+        });
+      }
+    }
 
     await clearPremiumEntitlement(user, "inactive", "restore_no_active_purchase");
 
