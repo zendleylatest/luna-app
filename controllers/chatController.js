@@ -122,6 +122,8 @@ async function clearPremiumEntitlement(user, status = "inactive", source = "rest
   user.subscription = {
     ...(user.subscription || {}),
     status: normalizeSubscriptionStatus(status),
+    autoRenewing: false,
+    isTrial: false,
     source,
     lastVerifiedAt: new Date(),
   };
@@ -187,6 +189,9 @@ async function applyStoreVerification(user, verification) {
     ...(user.subscription || {}),
     status: verification.status || "active",
     expiresAt: verification.expiresAt ? new Date(verification.expiresAt) : null,
+    autoRenewing:
+      typeof verification.autoRenewing === "boolean" ? verification.autoRenewing : null,
+    isTrial: verification.isTrial === true,
     source: verification.source || "google_play",
     lastVerifiedAt: new Date(),
   };
@@ -301,6 +306,11 @@ async function buildEntitlement(user) {
       productId: user?.subscription?.productId || null,
       platform: user?.subscription?.platform || "none",
       expiresAt: user?.subscription?.expiresAt || null,
+      autoRenewing:
+        typeof user?.subscription?.autoRenewing === "boolean"
+          ? user.subscription.autoRenewing
+          : null,
+      isTrial: user?.subscription?.isTrial === true,
       lastVerifiedAt: user?.subscription?.lastVerifiedAt || null,
       source: user?.subscription?.source || "none",
     },

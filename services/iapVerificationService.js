@@ -73,6 +73,9 @@ function buildAndroidSubscriptionResult(data) {
     ok: active,
     status: active ? "active" : "expired",
     expiresAt: expiryMs ? new Date(expiryMs).toISOString() : null,
+    autoRenewing: typeof data?.autoRenewing === "boolean" ? data.autoRenewing : null,
+    // paymentState 2 = free trial.
+    isTrial: paymentState === 2,
     platform: "android",
     source: "google_play",
     payload: {
@@ -115,6 +118,12 @@ function buildAndroidSubscriptionV2Result(data, productId) {
     ok: active,
     status: active ? "active" : "expired",
     expiresAt: expiryMs ? new Date(expiryMs).toISOString() : null,
+    autoRenewing:
+      typeof autoRenewingPlan?.autoRenewEnabled === "boolean"
+        ? autoRenewingPlan.autoRenewEnabled
+        : null,
+    // The v2 payload has no simple trial flag; leave unknown rather than guess.
+    isTrial: null,
     platform: "android",
     source: "google_play_v2",
     payload: {
@@ -183,6 +192,9 @@ function buildAmazonSubscriptionResult(data, productId, receiptId) {
     status,
     retryable: false,
     expiresAt: renewalDateMs ? new Date(renewalDateMs).toISOString() : null,
+    autoRenewing:
+      typeof data?.autoRenewing === "boolean" ? data.autoRenewing : !cancelDateMs,
+    isTrial: Number(data?.freeTrialEndDate || 0) > now,
     platform: "amazon",
     source: "amazon_rvs",
     payload: {
@@ -315,6 +327,38 @@ async function verifyIapPurchase({
         retryable,
         platform: "amazon",
         source: "amazon_rvs",
+        expiresAt: null,
+        payload: {},
+        reason: e.message,
+      };
+    }
+  }
+
+  if (platform === "ios") {
+    try {
+      const { verifyAppleTransaction } = require("./appleIapService");
+      const result = await verifyAppleTransaction({ transactionId: purchaseToken });
+      return {
+        ok: result.isActive,
+        status: result.isActive ? "active" : "expired",
+        platform: "ios",
+        source: "app_store",
+        expiresAt: result.expiresAt ? result.expiresAt.toISOString() : null,
+        autoRenewing: result.autoRenewing,
+        isTrial: result.isTrial,
+        payload: {
+           originalTransactionId: result.originalTransactionId,
+           productId: result.productId,
+        },
+      };
+    } catch (e) {
+      console.warn("[iapVerify] iOS verification failed:", e.message);
+      return {
+        ok: false,
+        status: "verify_failed",
+        retryable: true,
+        platform: "ios",
+        source: "app_store",
         expiresAt: null,
         payload: {},
         reason: e.message,

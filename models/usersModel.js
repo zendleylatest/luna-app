@@ -27,6 +27,21 @@ const userSchema = new mongoose.Schema(
     otp: {
       type: String,
     },
+    // When the signup verification code was last sent (resend cooldown).
+    otpSentAt: {
+      type: Date,
+    },
+    // Wrong guesses against the current signup / guest-binding code. Reset
+    // whenever a fresh code is issued.
+    otpAttempts: {
+      type: Number,
+      default: 0,
+    },
+    // Resend rate limit window, shared by signup and guest-binding codes.
+    otpResend: {
+      count: { type: Number, default: 0 },
+      windowStart: { type: Date },
+    },
     emailVerified: {
       type: Boolean,
     },
@@ -62,8 +77,24 @@ const userSchema = new mongoose.Schema(
     googleId: {
       type: String,
     },
+    appleId: {
+      type: String,
+      index: true,
+      sparse: true,
+    },
     resetOTP: {
       type: String,
+    },
+    resetOtpSentAt: {
+      type: Date,
+    },
+    resetOtpAttempts: {
+      type: Number,
+      default: 0,
+    },
+    resetOtpResend: {
+      count: { type: Number, default: 0 },
+      windowStart: { type: Date },
     },
     creationsPublic: {
       type: Boolean,
@@ -135,6 +166,9 @@ const userSchema = new mongoose.Schema(
         default: "inactive",
       },
       expiresAt: Date,
+      // null = unknown (store didn't say); false = user cancelled renewal.
+      autoRenewing: { type: Boolean, default: null },
+      isTrial: { type: Boolean, default: false },
       lastVerifiedAt: Date,
       source: {
         type: String,

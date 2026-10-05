@@ -100,3 +100,46 @@ test("empty/garbage response is rejected as invalid, not active", () => {
   assert.equal(result.ok, false);
   assert.equal(result.status, "invalid");
 });
+
+test("customer cancelled auto-renew mid-term: still active until renewalDate, flagged as not renewing", () => {
+  const result = buildAmazonSubscriptionResult(
+    baseResponse({ autoRenewing: false, renewalDate: Date.now() + 7 * 24 * 60 * 60 * 1000 }),
+    PRODUCT_ID,
+    RECEIPT_ID
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.status, "active");
+  assert.equal(result.autoRenewing, false);
+  assert.equal(
+    new Date(result.expiresAt).getTime() > Date.now(),
+    true,
+    "expiresAt must be the paid-through date so the entitlement ends then"
+  );
+});
+
+test("after the paid term ends (renewalDate passed + cancelDate set) it is expired", () => {
+  const result = buildAmazonSubscriptionResult(
+    baseResponse({
+      autoRenewing: false,
+      renewalDate: Date.now() - 1000,
+      cancelDate: Date.now() - 500,
+    }),
+    PRODUCT_ID,
+    RECEIPT_ID
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "expired");
+});
+
+test("free trial end date in the future is reported as a trial", () => {
+  const result = buildAmazonSubscriptionResult(
+    baseResponse({ freeTrialEndDate: Date.now() + 3 * 24 * 60 * 60 * 1000 }),
+    PRODUCT_ID,
+    RECEIPT_ID
+  );
+  assert.equal(result.isTrial, true);
+  assert.equal(
+    buildAmazonSubscriptionResult(baseResponse(), PRODUCT_ID, RECEIPT_ID).isTrial,
+    false
+  );
+});

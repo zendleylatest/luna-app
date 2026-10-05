@@ -30,7 +30,7 @@ function buildOtpEmailHtml({ title, preheader, otp, message }) {
           <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:520px;background:#ffffff;border-radius:22px;overflow:hidden;border:1px solid #ece1e0;box-shadow:0 18px 45px rgba(46,25,48,0.12);">
             <tr>
               <td style="background:#5b2a4d;padding:26px 28px;text-align:center;">
-                <div style="font-size:13px;letter-spacing:2px;text-transform:uppercase;color:#f3e3cc;font-weight:700;">Luna App</div>
+                <div style="font-size:13px;letter-spacing:2px;text-transform:uppercase;color:#f3e3cc;font-weight:700;">Lunear App</div>
                 <h1 style="margin:8px 0 0;font-size:24px;line-height:1.25;color:#ffffff;">${safeTitle}</h1>
               </td>
             </tr>
@@ -47,7 +47,7 @@ function buildOtpEmailHtml({ title, preheader, otp, message }) {
             <tr>
               <td style="padding:18px 28px 28px;text-align:center;">
                 <div style="height:1px;background:#e6eef7;margin-bottom:18px;"></div>
-                <p style="margin:0;font-size:12px;line-height:1.5;color:#7a6b7c;">This is an automated message from Luna App.</p>
+                <p style="margin:0;font-size:12px;line-height:1.5;color:#7a6b7c;">This is an automated message from Lunear App.</p>
               </td>
             </tr>
           </table>
@@ -83,16 +83,16 @@ async function sendOTPEmail(email, otp) {
   });
 
   await transporter.sendMail({
-    from: `"Luna App" <${user}>`,
+    from: `"Lunear App" <${user}>`,
     to: email,
-    subject: "Verify your Luna App email",
-    text: `Your Luna App verification code is: ${otp}`,
+    subject: "Verify your Lunear App email",
+    text: `Your Lunear App verification code is: ${otp}`,
     html: buildOtpEmailHtml({
       title: "Verify your email",
-      preheader: `Your Luna App verification code is ${otp}.`,
+      preheader: `Your Lunear App verification code is ${otp}.`,
       otp,
       message:
-        "Use this one-time code to verify your email address and finish setting up your Luna App account.",
+        "Use this one-time code to verify your email address and finish setting up your Lunear App account.",
     }),
   });
 }
@@ -120,7 +120,7 @@ async function sendEmail(email, subject, text, options = {}) {
   });
 
   await transporter.sendMail({
-    from: `"Luna App" <${user}>`,
+    from: `"Lunear App" <${user}>`,
     to: email,
     subject,
     text,

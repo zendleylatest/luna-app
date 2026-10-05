@@ -3,6 +3,7 @@ const crypto = require("crypto");
 const mongoose = require("mongoose");
 const { OAuth2Client } = require("google-auth-library");
 const { setUser } = require("../services/userAuthService");
+const { appleAuthService } = require("../services/appleAuthService");
 const {
   sendOTPEmail,
   sendEmail,
@@ -39,6 +40,131 @@ const googleClient = process.env.GOOGLE_CLIENT_ID
 
 const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 const isValidOTP = (otp) => typeof otp === "string" && /^\d{6}$/.test(otp);
+
+const OTP_RESEND_COOLDOWN_MS = 60 * 1000;
+const OTP_RESEND_WINDOW_MS = 60 * 60 * 1000;
+const OTP_RESEND_MAX_PER_WINDOW = 5;
+
+const OTP_MAX_WRONG_ATTEMPTS = 5;
+const TOO_MANY_ATTEMPTS_ERROR = "Too many incorrect attempts. Request a new code.";
+
+const generateOtp = () => crypto.randomInt(100000, 1000000).toString();
+
+// A double tap (or two devices) must not send two emails and leave the user
+// holding the code that was overwritten. Single-process guard: the second
+// request for the same user is refused while the first is still sending.
+const otpSendsInFlight = new Set();
+
+/**
+ * Cooldown + hourly cap shared by every code-sending endpoint.
+ * `window` is `{ count, windowStart }`; returns either `{ ok: true, count,
+ * windowStart }` for the state to store after a successful send, or a
+ * refusal with `retryAfterSeconds`.
+ */
+function checkOtpSendLimits({ sentAt, window }) {
+  const now = Date.now();
+  const sentAtMs = sentAt ? new Date(sentAt).getTime() : 0;
+  if (sentAtMs && now - sentAtMs < OTP_RESEND_COOLDOWN_MS) {
+    return {
+      ok: false,
+      status: 429,
+      error: "Please wait before requesting another code.",
+      retryAfterSeconds: Math.ceil((OTP_RESEND_COOLDOWN_MS - (now - sentAtMs)) / 1000),
+    };
+  }
+
+  const windowStartMs = window?.windowStart ? new Date(window.windowStart).getTime() : 0;
+  const windowOpen = Boolean(windowStartMs) && now - windowStartMs < OTP_RESEND_WINDOW_MS;
+  const count = windowOpen ? window?.count || 0 : 0;
+  if (count >= OTP_RESEND_MAX_PER_WINDOW) {
+    return {
+      ok: false,
+      status: 429,
+      error: "Too many code requests. Please try again later.",
+      retryAfterSeconds: Math.ceil((OTP_RESEND_WINDOW_MS - (now - windowStartMs)) / 1000),
+    };
+  }
+
+  const sentDate = new Date(now);
+  return {
+    ok: true,
+    sentAt: sentDate,
+    nextWindow: {
+      count: count + 1,
+      windowStart: windowOpen ? new Date(windowStartMs) : sentDate,
+    },
+  };
+}
+
+/**
+ * Which pending code (if any) a resend applies to.
+ * - guest binding: the code lives in `pendingBinding` and goes to the new email
+ * - signup / unverified login: the code lives in `otp` and goes to `email`
+ */
+function otpTargetFor(user) {
+  if (user.pendingBinding?.otp) {
+    return {
+      kind: "binding",
+      email: user.pendingBinding.email,
+      sentAt: user.pendingBinding.requestedAt,
+    };
+  }
+  if (!user.isGuest && user.emailVerified === false) {
+    return { kind: "signup", email: user.email, sentAt: user.otpSentAt };
+  }
+  return null;
+}
+
+/**
+ * Issues a fresh verification code (replacing the old one) and emails it,
+ * enforcing a per-user cooldown and an hourly cap. State only changes after
+ * the email was handed off, so a failed send never invalidates the old code.
+ */
+async function issueFreshOtp(user) {
+  const target = otpTargetFor(user);
+  if (!target) {
+    return { ok: false, status: 400, error: "No pending verification for this account" };
+  }
+
+  const lockKey = String(user._id);
+  if (otpSendsInFlight.has(lockKey)) {
+    return {
+      ok: false,
+      status: 429,
+      error: "Please wait before requesting another code.",
+      retryAfterSeconds: 5,
+    };
+  }
+  otpSendsInFlight.add(lockKey);
+  try {
+    const limits = checkOtpSendLimits({ sentAt: target.sentAt, window: user.otpResend });
+    if (!limits.ok) return limits;
+
+    const otp = generateOtp();
+    try {
+      await sendOTPEmail(target.email, otp);
+    } catch (mailErr) {
+      console.error("resend OTP email error:", mailErr);
+      return { ok: false, status: 500, error: OTP_SEND_FAILED };
+    }
+
+    if (target.kind === "binding") {
+      user.pendingBinding.otp = otp;
+      // Restarts the 15-minute expiry window checked by verify-otp.
+      user.pendingBinding.requestedAt = limits.sentAt;
+    } else {
+      user.otp = otp;
+      user.otpSentAt = limits.sentAt;
+    }
+    user.otpAttempts = 0;
+    user.otpResend = limits.nextWindow;
+    await user.save();
+
+    return { ok: true, cooldownSeconds: OTP_RESEND_COOLDOWN_MS / 1000 };
+  } finally {
+    otpSendsInFlight.delete(lockKey);
+  }
+}
 
 function authResponse(user) {
   return {
@@ -378,6 +504,7 @@ async function handleBindGuestAccount(req, res) {
       otp,
       requestedAt: new Date(),
     };
+    user.otpAttempts = 0;
     await user.save();
 
     return res.status(200).json({
@@ -413,6 +540,7 @@ async function handleUserSignUp(req, res) {
       password: hashed,
       image: req.file ? `/uploads/${req.file.filename}` : null,
       otp,
+      otpSentAt: new Date(),
       emailVerified: false,
       ...(identity.androidId ? { androidId: identity.androidId } : {}),
       ...(identity.androidIdHash ? { androidIdHash: identity.androidIdHash } : {}),
@@ -456,6 +584,13 @@ async function handleVerifyOTP(req, res) {
       return res.status(400).json({ error: USER_NOT_FOUND });
     }
 
+    if ((user.otpAttempts || 0) >= OTP_MAX_WRONG_ATTEMPTS) {
+      return res.status(429).json({
+        error: TOO_MANY_ATTEMPTS_ERROR,
+        tooManyAttempts: true,
+      });
+    }
+
     const pendingBinding = user.pendingBinding;
     if (pendingBinding?.otp) {
       const requestedAt = pendingBinding.requestedAt
@@ -467,6 +602,7 @@ async function handleVerifyOTP(req, res) {
         return res.status(400).json({ error: "Verification code expired" });
       }
       if (pendingBinding.otp !== String(otp).trim()) {
+        await User.updateOne({ _id: user._id }, { $inc: { otpAttempts: 1 } });
         return res.status(400).json({ error: INVALID_OTP });
       }
 
@@ -486,6 +622,7 @@ async function handleVerifyOTP(req, res) {
       user.guestKey = undefined;
       user.pendingBinding = undefined;
       user.otp = null;
+      user.otpAttempts = 0;
       await user.save();
 
       if (user.androidIdHash) {
@@ -503,11 +640,13 @@ async function handleVerifyOTP(req, res) {
     }
 
     if (user.otp !== String(otp).trim()) {
+      await User.updateOne({ _id: user._id }, { $inc: { otpAttempts: 1 } });
       return res.status(400).json({ error: INVALID_OTP });
     }
 
     user.emailVerified = true;
     user.otp = null;
+    user.otpAttempts = 0;
     await user.save();
 
     res.json({ message: "Email verified successfully." });
@@ -532,7 +671,15 @@ async function handleUserLogin(req, res) {
     }
 
     if (user.emailVerified === false) {
-      return res.status(400).json({ error: EMAIL_NOT_VERIFIED });
+      // The app opens the OTP screen from this response, so it needs the
+      // userId, and the user needs a code they can still use. Cooldown/limit
+      // refusals are fine here: the OTP screen's Resend button covers them.
+      try {
+        await issueFreshOtp(user);
+      } catch (otpErr) {
+        console.error("login OTP issue error:", otpErr);
+      }
+      return res.status(400).json({ error: EMAIL_NOT_VERIFIED, userId: user._id });
     }
 
     const ok = await bcrypt.compare(password, user.password);
@@ -552,6 +699,36 @@ async function handleUserLogin(req, res) {
     });
   } catch (err) {
     res.status(500).json({ error: NETWORK_ERROR });
+  }
+}
+
+async function handleResendOTP(req, res) {
+  try {
+    const userId = String(req.body?.userId ?? "").trim();
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) return res.status(400).json({ error: USER_NOT_FOUND });
+    if (user.isBanned) {
+      return res.status(403).json({ error: "Your account is banned. Please contact support." });
+    }
+
+    const result = await issueFreshOtp(user);
+    if (!result.ok) {
+      return res.status(result.status).json({
+        error: result.error,
+        ...(result.retryAfterSeconds ? { retryAfterSeconds: result.retryAfterSeconds } : {}),
+      });
+    }
+    return res.json({
+      message: "Verification code sent.",
+      cooldownSeconds: result.cooldownSeconds,
+    });
+  } catch (err) {
+    console.error("resend OTP error:", err);
+    return res.status(500).json({ error: NETWORK_ERROR });
   }
 }
 
@@ -622,6 +799,40 @@ async function handleGoogleLogin(req, res) {
   }
 }
 
+/**
+ * POST /auth/apple
+ * Body: { identity_token: string, email?: string, full_name?: string }
+ *
+ * Verifies the Apple identity token directly against Apple's JWKS (no
+ * third-party service). Creates or finds the user and returns a JWT.
+ */
+async function handleAppleLogin(req, res) {
+  try {
+    if (!process.env.APPLE_BUNDLE_ID && !process.env.APPLE_SERVICE_ID) {
+      return res.status(500).json({ error: "Apple sign-in is not configured on this server." });
+    }
+
+    const { identity_token, email, full_name } = req.body;
+    if (!identity_token) {
+      return res.status(400).json({ error: "Apple identity token required." });
+    }
+
+    const result = await appleAuthService(
+      { identity_token, email, full_name },
+      User,
+      setUser
+    );
+    return res.json(result);
+  } catch (err) {
+    const status = err.status || 500;
+    console.error("Apple login error:", err.message);
+    return res.status(status).json({
+      error: err.message || "Apple authentication failed.",
+      ...(err.bannedReason ? { bannedReason: err.bannedReason } : {}),
+    });
+  }
+}
+
 async function handleGetProfile(req, res) {
   try {
     const { id } = req.params;
@@ -630,7 +841,7 @@ async function handleGetProfile(req, res) {
     }
 
     const user = await User.findById(id).select(
-      "-otp -resetOTP -password -emailVerified -guestKey -pendingBinding"
+      "-otp -otpSentAt -otpResend -otpAttempts -resetOtpSentAt -resetOtpAttempts -resetOtpResend -resetOTP -password -emailVerified -guestKey -pendingBinding"
     );
     if (!user) return res.status(404).json({ error: "User not found" });
 
@@ -745,6 +956,7 @@ async function handleDeleteAccount(req, res) {
 }
 
 async function handleForgotPassword(req, res) {
+  const lockKey = { current: null };
   try {
     const { email } = req.body;
     if (!email) {
@@ -759,29 +971,57 @@ async function handleForgotPassword(req, res) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    user.resetOTP = otp;
-    await user.save();
+    lockKey.current = `reset:${user._id}`;
+    if (otpSendsInFlight.has(lockKey.current)) {
+      lockKey.current = null; // not ours to release
+      return res.status(429).json({
+        error: "Please wait before requesting another code.",
+        retryAfterSeconds: 5,
+      });
+    }
+    otpSendsInFlight.add(lockKey.current);
 
+    const limits = checkOtpSendLimits({
+      sentAt: user.resetOtpSentAt,
+      window: user.resetOtpResend,
+    });
+    if (!limits.ok) {
+      return res.status(limits.status).json({
+        error: limits.error,
+        retryAfterSeconds: limits.retryAfterSeconds,
+      });
+    }
+
+    const otp = generateOtp();
     logOtp(email, otp, "password reset");
     await sendEmail(
       email,
-      "Reset your Luna App password",
-      `Your Luna App password reset code is: ${otp}`,
+      "Reset your Lunear App password",
+      `Your Lunear App password reset code is: ${otp}`,
       {
         html: buildOtpEmailHtml({
           title: "Reset your password",
-          preheader: `Your Luna App password reset code is ${otp}.`,
+          preheader: `Your Lunear App password reset code is ${otp}.`,
           otp,
           message:
-            "Use this one-time code to reset your Luna App password and get back into your account.",
+            "Use this one-time code to reset your Lunear App password and get back into your account.",
         }),
       }
     );
-    res.json({ message: "OTP sent" });
+
+    // Only replace the stored code once the email was handed off.
+    user.resetOTP = otp;
+    user.resetOtpSentAt = limits.sentAt;
+    user.resetOtpAttempts = 0;
+    user.resetOtpResend = limits.nextWindow;
+    await user.save();
+
+    res.json({ message: "OTP sent", cooldownSeconds: OTP_RESEND_COOLDOWN_MS / 1000 });
   } catch (err) {
     console.error("forgotPassword error:", err);
     res.status(500).json({ error: NETWORK_ERROR });
+  } finally {
+    if (lockKey.current) otpSendsInFlight.delete(lockKey.current);
   }
 }
 
@@ -798,13 +1038,24 @@ async function handleResetPassword(req, res) {
       return res.status(400).json({ error: "Password must be at least 6 characters" });
     }
 
-    const user = await User.findOne({ email, resetOTP: String(otp).trim() });
-    if (!user) {
+    const user = await User.findOne({ email });
+    if (!user || !user.resetOTP) {
+      return res.status(400).json({ error: "Invalid OTP" });
+    }
+    if ((user.resetOtpAttempts || 0) >= OTP_MAX_WRONG_ATTEMPTS) {
+      return res.status(429).json({
+        error: TOO_MANY_ATTEMPTS_ERROR,
+        tooManyAttempts: true,
+      });
+    }
+    if (user.resetOTP !== String(otp).trim()) {
+      await User.updateOne({ _id: user._id }, { $inc: { resetOtpAttempts: 1 } });
       return res.status(400).json({ error: "Invalid OTP" });
     }
 
     user.password = await bcrypt.hash(newPassword, 10);
     user.resetOTP = null;
+    user.resetOtpAttempts = 0;
     await user.save();
 
     res.json({ message: "Password reset successful" });
@@ -822,7 +1073,9 @@ module.exports = {
   handleUserSignUp,
   handleUserLogin,
   handleVerifyOTP,
+  handleResendOTP,
   handleGoogleLogin,
+  handleAppleLogin,
   handleGetProfile,
   handleUpdateProfile,
   handleDeleteAccount,

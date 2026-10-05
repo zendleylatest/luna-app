@@ -7,7 +7,9 @@ const {
   handleUserLogin,
   handleUserSignUp,
   handleVerifyOTP,
+  handleResendOTP,
   handleGoogleLogin,
+  handleAppleLogin,
   handleGetProfile,
   handleUpdateProfile,
   handleDeleteAccount,
@@ -26,8 +28,10 @@ router.post("/guest/restore", handleRestoreGuest);
 router.post("/guest/device", authenticate, handleUpdateGuestDevice);
 router.post("/bind-account", authenticate, handleBindGuestAccount);
 router.post("/verify-otp", handleVerifyOTP);
+router.post("/resend-otp", handleResendOTP);
 router.post("/login", upload.single("image"), handleUserLogin);
 router.post("/google-login", handleGoogleLogin);
+router.post("/apple", handleAppleLogin);
 
 router.get("/profile/:id", authenticate, handleGetProfile);
 router.put("/profile/:id", authenticate, uploadProfile.single("profileImage"), handleUpdateProfile);

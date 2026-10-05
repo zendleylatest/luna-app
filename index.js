@@ -15,6 +15,7 @@ const chatRouter = require("./routes/chatRoutes");
 const faqRouter = require("./routes/faqRoutes");
 const knowledgeRouter = require("./routes/knowledgeRoutes");
 const lunaCycleRouter = require("./routes/lunaCycleRoutes");
+const appleNotificationRouter = require("./routes/appleNotificationRoutes");
 const { ensureFirebaseAdmin } = require("./utils/firebaseAdminInit");
 
 const mongoUri = process.env.MONGODB_URI;
@@ -151,6 +152,7 @@ app.use("/api/chat", chatRouter);
 app.use("/api/faq", faqRouter);
 app.use("/api/knowledge", knowledgeRouter);
 app.use("/api/luna-cycle", lunaCycleRouter);
+app.use("/api/apple/notifications", appleNotificationRouter);
 // gsddhh
 app.use((req, res) => {
   res.status(404).json({ error: "Not found" });
