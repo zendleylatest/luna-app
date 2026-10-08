@@ -18,7 +18,8 @@ async function handleDebugPeriodReminder(req, res) {
     const scheduled = scheduleDebugReminder(
       req.authUser._id,
       req.body?.delaySeconds,
-      record?.state || {}
+      record?.state || {},
+      record?.languageCode
     );
     return res.status(202).json({ success: true, ...scheduled });
   } catch (err) {

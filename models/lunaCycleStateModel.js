@@ -23,6 +23,11 @@ const lunaCycleStateSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    // App language (2-letter code) sent on save; reminder pushes are written in it.
+    languageCode: {
+      type: String,
+      default: "en",
+    },
     // Predicted period start (YYYY-MM-DD) the last reminder was sent for; keeps
     // a reminder from being sent twice.
     lastPeriodReminderFor: {

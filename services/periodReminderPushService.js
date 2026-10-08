@@ -1,9 +1,17 @@
 const User = require("../models/usersModel");
 const LunaCycleState = require("../models/lunaCycleStateModel");
 const { ensureFirebaseAdmin } = require("../utils/firebaseAdminInit");
+const { reminderCopy } = require("./periodReminderMessages");
 
 const LEAD_DAYS = 2;
+// Reminders go out between 09:00 and 20:59 local time. The upper bound stops a
+// reminder from arriving at night if the server was down at 09:00.
 const SEND_HOUR_LOCAL = 9;
+const SEND_HOUR_END_LOCAL = 21;
+// A reminder is only useful today; don't let the push services deliver it
+// days later to a phone that was off.
+const PUSH_TTL_MS = 12 * 60 * 60 * 1000;
+const ANDROID_PACKAGE = process.env.ANDROID_PACKAGE_NAME || "com.speckpro.periodtracker.luna.app";
 const SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DEBUG_DELAY_SECONDS = 10 * 60;
@@ -73,7 +81,8 @@ function nextPeriodStart(state, todayMs) {
 function reminderDue({ state, utcOffsetMinutes, lastReminderFor, nowMs }) {
   if (!state || state.periodReminders === false) return null;
   const local = localNow(nowMs, utcOffsetMinutes);
-  if (local.getUTCHours() < SEND_HOUR_LOCAL) return null;
+  const hour = local.getUTCHours();
+  if (hour < SEND_HOUR_LOCAL || hour >= SEND_HOUR_END_LOCAL) return null;
 
   const todayMs = localDayStart(nowMs, utcOffsetMinutes);
   const next = nextPeriodStart(state, todayMs);
@@ -85,12 +94,10 @@ function reminderDue({ state, utcOffsetMinutes, lastReminderFor, nowMs }) {
   return { key };
 }
 
-function buildReminderMessage(state, { debug = false } = {}) {
+function buildReminderMessage(state, { debug = false, languageCode = "en" } = {}) {
   const hideContent = state?.hideNotificationContent !== false;
-  const base = hideContent
-    ? { title: "Lunear reminder", body: "You have a reminder waiting in Lunear." }
-    : { title: "Period reminder", body: "Your period is expected in 2 days." };
-  return debug ? { ...base, body: `${base.body} (debug test)` } : base;
+  const base = reminderCopy(languageCode, { hideContent });
+  return debug ? { ...base, body: `${base.body} (debug test)` } : { ...base };
 }
 
 // ── sending ─────────────────────────────────────────────────────────────────
@@ -156,11 +163,24 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
   const tokens = (user.deviceTokens || []).map((d) => d.token).filter(Boolean);
   if (!tokens.length) return { sent: 0, reason: "no_tokens" };
 
+  const expirySeconds = Math.floor((Date.now() + PUSH_TTL_MS) / 1000);
   const response = await messaging.sendEachForMulticast({
     tokens,
     notification: { title, body },
-    android: { priority: "high" },
-    data: Object.fromEntries(Object.entries(data).map(([k, v]) => [String(k), String(v)])),
+    android: {
+      priority: "high",
+      ttl: PUSH_TTL_MS,
+      // A repeat send replaces the earlier one in the tray instead of stacking.
+      collapseKey: "period_reminder",
+      notification: { tag: "period_reminder" },
+    },
+    apns: {
+      headers: { "apns-priority": "10", "apns-expiration": String(expirySeconds) },
+      payload: { aps: { sound: "default" } },
+    },
+    data: Object.fromEntries(
+      Object.entries({ targetPackageNames: ANDROID_PACKAGE, ...data }).map(([k, v]) => [String(k), String(v)])
+    ),
   });
 
   const dead = [];
@@ -182,7 +202,11 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
  */
 async function sweepPeriodReminders({
   nowMs = Date.now(),
-  cursor = () => LunaCycleState.find({ "state.periodReminders": { $ne: false } }).lean().cursor(),
+  cursor = () =>
+    LunaCycleState.find({ "state.periodReminders": { $ne: false } })
+      .select("-aiInsightsCache")
+      .lean()
+      .cursor(),
   claim = async (doc, key) =>
     LunaCycleState.findOneAndUpdate(
       { _id: doc._id, lastPeriodReminderFor: { $ne: key } },
@@ -209,7 +233,7 @@ async function sweepPeriodReminders({
     if (!claimed) continue; // another instance got it
 
     try {
-      const message = buildReminderMessage(doc.state);
+      const message = buildReminderMessage(doc.state, { languageCode: doc.languageCode });
       const result = await send(doc.userId, {
         ...message,
         data: { type: "period_reminder", periodStart: due.key },
@@ -266,7 +290,7 @@ function debugRemindersEnabled() {
  * pending one, so the push always lands [delaySeconds] after the latest call.
  * In-memory only: lost on server restart, which is fine for debugging.
  */
-function scheduleDebugReminder(userId, delaySeconds, state) {
+function scheduleDebugReminder(userId, delaySeconds, state, languageCode = "en") {
   const seconds = Math.min(
     Math.max(Number(delaySeconds) || DEFAULT_DEBUG_DELAY_SECONDS, 1),
     MAX_DEBUG_DELAY_SECONDS
@@ -276,7 +300,7 @@ function scheduleDebugReminder(userId, delaySeconds, state) {
   const timer = setTimeout(async () => {
     debugTimers.delete(key);
     try {
-      const message = buildReminderMessage(state, { debug: true });
+      const message = buildReminderMessage(state, { debug: true, languageCode });
       const result = await sendPushToUser(userId, {
         ...message,
         data: { type: "period_reminder_debug" },
@@ -303,4 +327,5 @@ module.exports = {
   scheduleDebugReminder,
   LEAD_DAYS,
   SEND_HOUR_LOCAL,
+  SEND_HOUR_END_LOCAL,
 };

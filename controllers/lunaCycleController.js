@@ -72,6 +72,9 @@ async function saveLunaCycleState(req, res) {
         ? { utcOffsetMinutes: Math.round(offset) }
         : {};
 
+    const language = String(req.body?.languageCode || "").toLowerCase().split(/[-_]/)[0];
+    const languageUpdate = /^[a-z]{2}$/.test(language) ? { languageCode: language } : {};
+
     const record = await LunaCycleState.findOneAndUpdate(
       { userId: req.authUser._id },
       {
@@ -79,6 +82,7 @@ async function saveLunaCycleState(req, res) {
           state,
           schemaVersion: Number(req.body.schemaVersion) || 1,
           ...offsetUpdate,
+          ...languageUpdate,
         },
       },
       { new: true, upsert: true, setDefaultsOnInsert: true }

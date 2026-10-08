@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { MESSAGES, resolveLanguage, reminderCopy } = require("../services/periodReminderMessages");
 const {
   periodStartsFromLogs,
   nextPeriodStart,
@@ -134,4 +135,36 @@ test("a debug reminder replaces the previous pending one and clamps the delay", 
   const c = scheduleDebugReminder("user-x", "nonsense", {});
   assert.equal(c.delaySeconds, 600);
   // timers are unref'd, so the test process can exit without waiting
+});
+
+test("no reminder is sent after 21:00 local, even on the due day", () => {
+  const state = { cycleLength: 28, logs: flow("2026-10-01"), periodReminders: true };
+  assert.ok(reminderDue({ state, utcOffsetMinutes: 0, lastReminderFor: null, nowMs: at("2026-10-27", 20) }));
+  assert.equal(reminderDue({ state, utcOffsetMinutes: 0, lastReminderFor: null, nowMs: at("2026-10-27", 21) }), null);
+  assert.equal(reminderDue({ state, utcOffsetMinutes: 0, lastReminderFor: null, nowMs: at("2026-10-27", 23) }), null);
+});
+
+test("every supported language has complete private and detailed copy", () => {
+  assert.equal(Object.keys(MESSAGES).length, 13);
+  for (const [lang, copy] of Object.entries(MESSAGES)) {
+    for (const kind of ["private", "detailed"]) {
+      assert.ok(copy[kind].title && copy[kind].body, `${lang}.${kind} incomplete`);
+    }
+    // The private text must not mention periods/cycles in English.
+    if (lang === "en") assert.doesNotMatch(copy.private.body + copy.private.title, /period|cycle/i);
+  }
+});
+
+test("language codes are normalised and unknown ones fall back to English", () => {
+  assert.equal(resolveLanguage("pt-BR"), "pt");
+  assert.equal(resolveLanguage("ZH_cn"), "zh");
+  assert.equal(resolveLanguage("xx"), "en");
+  assert.equal(resolveLanguage(undefined), "en");
+  assert.equal(reminderCopy("fr", { hideContent: false }).title, "Rappel de règles");
+});
+
+test("the push is written in the user's language and honours the privacy setting", () => {
+  assert.equal(buildReminderMessage({ hideNotificationContent: false }, { languageCode: "de" }).title, "Perioden-Erinnerung");
+  assert.equal(buildReminderMessage({}, { languageCode: "es" }).title, "Recordatorio de Lunear");
+  assert.equal(buildReminderMessage({}, { languageCode: "nope" }).title, "Lunear reminder");
 });
