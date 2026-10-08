@@ -17,6 +17,7 @@ const knowledgeRouter = require("./routes/knowledgeRoutes");
 const lunaCycleRouter = require("./routes/lunaCycleRoutes");
 const appleNotificationRouter = require("./routes/appleNotificationRoutes");
 const { ensureFirebaseAdmin } = require("./utils/firebaseAdminInit");
+const { startPeriodReminderScheduler } = require("./services/periodReminderPushService");
 
 const mongoUri = process.env.MONGODB_URI;
 if (!mongoUri) {
@@ -176,6 +177,7 @@ MongoDBConnect(mongoUri)
     app.listen(port, () => {
       console.log(`Server listening on port ${port}`);
     });
+    startPeriodReminderScheduler();
   })
   .catch(() => process.exit(1));
 

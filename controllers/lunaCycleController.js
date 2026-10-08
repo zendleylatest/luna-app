@@ -65,12 +65,20 @@ async function saveLunaCycleState(req, res) {
       });
     }
 
+    // Only trust a plausible offset (UTC-14 .. UTC+14); otherwise keep the old one.
+    const offset = Number(req.body?.utcOffsetMinutes);
+    const offsetUpdate =
+      Number.isFinite(offset) && Math.abs(offset) <= 14 * 60
+        ? { utcOffsetMinutes: Math.round(offset) }
+        : {};
+
     const record = await LunaCycleState.findOneAndUpdate(
       { userId: req.authUser._id },
       {
         $set: {
           state,
           schemaVersion: Number(req.body.schemaVersion) || 1,
+          ...offsetUpdate,
         },
       },
       { new: true, upsert: true, setDefaultsOnInsert: true }

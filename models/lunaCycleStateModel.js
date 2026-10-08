@@ -17,6 +17,18 @@ const lunaCycleStateSchema = new mongoose.Schema(
       type: Number,
       default: 1,
     },
+    // Minutes ahead of UTC on the user's device (e.g. 300 for UTC+5), sent by
+    // the app on save so period reminders go out at 9:00 local time.
+    utcOffsetMinutes: {
+      type: Number,
+      default: 0,
+    },
+    // Predicted period start (YYYY-MM-DD) the last reminder was sent for; keeps
+    // a reminder from being sent twice.
+    lastPeriodReminderFor: {
+      type: String,
+      default: null,
+    },
     aiInsightsCache: {
       stateHash: String,
       cards: [
