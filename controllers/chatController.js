@@ -784,6 +784,58 @@ async function handleGetEntitlement(req, res) {
   }
 }
 
+const LINKED_ELSEWHERE_CODE = "SUBSCRIPTION_LINKED_TO_ANOTHER_ACCOUNT";
+const LINKED_ELSEWHERE_MESSAGE =
+  "This subscription is already active on another Lunear account. Sign in to that account to use it, or wait until it ends.";
+
+/**
+ * A store subscription belongs to the store account, not the app account, so
+ * the same subscription could otherwise be attached to many app accounts.
+ * Returns another app user that currently holds an active subscription for
+ * the same Google purchase token, or the same Amazon account, or null.
+ */
+async function findOtherActiveOwner({ userId, platform, purchaseToken, storeUserId }) {
+  const stillActive = {
+    isPro: true,
+    $or: [
+      { "subscription.expiresAt": null },
+      { "subscription.expiresAt": { $exists: false } },
+      { "subscription.expiresAt": { $gt: new Date() } },
+    ],
+  };
+  const identity = [];
+  if (purchaseToken) identity.push({ "subscription.purchaseToken": purchaseToken });
+  if (platform === "amazon" && storeUserId) {
+    identity.push({
+      "subscription.platform": "amazon",
+      "subscription.storeUserId": storeUserId,
+    });
+  }
+  if (!identity.length) return null;
+  return User.findOne({ _id: { $ne: userId }, ...stillActive, $and: [{ $or: identity }] })
+    .select("_id")
+    .lean();
+}
+
+// POST /iap/ownership  { platform, storeUserId, purchaseToken? }
+// Lets the app ask, before starting a purchase, whether the store account's
+// subscription is already used by a different Lunear account.
+async function handleIapOwnership(req, res) {
+  try {
+    const { platform = "android", storeUserId, purchaseToken } = req.body || {};
+    const owner = await findOtherActiveOwner({
+      userId: req.authUser._id,
+      platform,
+      purchaseToken,
+      storeUserId,
+    });
+    return res.json({ linkedToAnotherAccount: Boolean(owner) });
+  } catch (err) {
+    console.error("[chat iap ownership]", err);
+    return res.status(500).json({ error: "Could not check subscription" });
+  }
+}
+
 async function handleVerifyIapPurchase(req, res) {
   try {
     const user = await User.findById(req.authUser._id);
@@ -823,6 +875,21 @@ async function handleVerifyIapPurchase(req, res) {
         success: false,
         error: "Purchase verification failed",
         verification,
+        entitlement: await buildEntitlement(user),
+      });
+    }
+
+    const otherOwner = await findOtherActiveOwner({
+      userId: user._id,
+      platform,
+      purchaseToken,
+      storeUserId,
+    });
+    if (otherOwner) {
+      return res.status(409).json({
+        success: false,
+        code: LINKED_ELSEWHERE_CODE,
+        error: LINKED_ELSEWHERE_MESSAGE,
         entitlement: await buildEntitlement(user),
       });
     }
@@ -916,5 +983,6 @@ module.exports = {
   handleDeleteSession,
   handleGetEntitlement,
   handleVerifyIapPurchase,
+  handleIapOwnership,
   handleClearPremiumAfterRestore,
 };

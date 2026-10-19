@@ -370,6 +370,11 @@ async function handleRestoreGuest(req, res) {
       });
     }
 
+    // Preview: tell the app a guest exists without signing it in or touching it.
+    if (req.body?.previewOnly === true) {
+      return res.json({ registered: true, guestExists: true });
+    }
+
     await attachGuestToDevice(user, device);
     logAuthUser("[guest restore]", user);
     return res.json({ registered: true, ...authResponse(user) });
