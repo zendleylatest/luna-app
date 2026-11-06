@@ -7,7 +7,7 @@ const generateAppleJWT = () => {
     throw new Error('APPLE_IAP_PRIVATE_KEY is not configured');
   }
   const formattedPrivateKey = privateKey.replace(/\\n/g, '\n');
-  return jwt.sign({}, formattedPrivateKey, {
+  return jwt.sign({ bid: process.env.APPLE_BUNDLE_ID }, formattedPrivateKey, {
     algorithm: 'ES256',
     keyid: process.env.APPLE_IAP_KEY_ID,
     issuer: process.env.APPLE_IAP_ISSUER_ID,
